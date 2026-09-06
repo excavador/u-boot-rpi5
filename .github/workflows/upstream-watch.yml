@@ -14,6 +14,11 @@ on:
   schedule:
     - cron: '0 7 * * 1'   # Mondays, 07:00 UTC
   workflow_dispatch:
+    inputs:
+      base:
+        description: 'Override the base ref (for testing that this job can actually report)'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -30,7 +35,7 @@ jobs:
         id: cmp
         env:
           UPSTREAM: talos-rpi5/u-boot
-          BASE: v2025.04-rpi5-3
+          BASE: ${{ inputs.base || 'v2025.04-rpi5-3' }}
         run: |
           git remote add upstream "https://github.com/${UPSTREAM}.git"
           git fetch -q --tags upstream
