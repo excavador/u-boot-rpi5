@@ -1,0 +1,93 @@
+# Build pi5's u-boot and publish it as a release asset.
+#
+# The estate's control plane boots from this binary. Before this workflow
+# existed it was produced by a shell script on one workstation, with the
+# config carried as a heredoc fragment appended to .config -- so the thing
+# standing between the cluster and a boot was unreviewable and unbuildable
+# by anyone else. The patches now live in git (see the hive branch) and the
+# binary is built here.
+name: build
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # u-boot stamps `git describe` into the binary
+
+      - name: install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            gcc-aarch64-linux-gnu build-essential git bison flex libssl-dev \
+            device-tree-compiler python3 python3-dev python3-setuptools swig \
+            bc ca-certificates uuid-dev libgnutls28-dev
+
+      - name: configure
+        env: { CROSS_COMPILE: aarch64-linux-gnu-, ARCH: arm }
+        run: make rpi_5_defconfig
+
+      # Kconfig SILENTLY DROPS an option whose dependencies are unmet. Without
+      # this the build succeeds, the binary looks fine, and the failure only
+      # reappears on the node -- after a flash. EFI_RT_VOLATILE_STORE is the
+      # option Talos needs; the other three are its dependencies and the DT
+      # path fix, asserted so a future defconfig edit cannot quietly take the
+      # fix with it.
+      - name: assert the config we depend on survived
+        run: |
+          fail=0
+          for o in CONFIG_FAT_WRITE CONFIG_EFI_VARIABLE_FILE_STORE \
+                   CONFIG_EFI_RT_VOLATILE_STORE CONFIG_OF_UPSTREAM; do
+            if grep -qx "${o}=y" .config; then
+              echo "ok   ${o}=y"
+            else
+              echo "MISSING ${o} -- $(grep -m1 "^# ${o} is not set" .config || echo 'absent from .config')"
+              fail=1
+            fi
+          done
+          [ "$fail" = 0 ] || { echo "refusing to ship a binary that would fail the same way"; exit 1; }
+
+      - name: build
+        env: { CROSS_COMPILE: aarch64-linux-gnu-, ARCH: arm }
+        run: make -j"$(nproc)"
+
+      - name: stamp
+        run: |
+          mkdir -p artifacts
+          cp u-boot.bin artifacts/
+          cp .config artifacts/u-boot.config
+          ( cd artifacts && sha256sum u-boot.bin > SHA256SUMS )
+          echo "--- version string baked into the binary ---"
+          strings -t d artifacts/u-boot.bin | grep -m1 "U-Boot 20"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: u-boot-${{ github.sha }}
+          path: artifacts/*
+          if-no-files-found: error
+
+      - name: release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          fail_on_unmatched_files: true
+          body: |
+            pi5 u-boot with `CONFIG_EFI_RT_VOLATILE_STORE`, built from the `hive` branch.
+
+            Without it `talosctl upgrade` fails at the bootloader step with
+            `failed to create efivarfs reader/writer: invalid argument`, because
+            Linux only permits the efivarfs rw remount when the firmware
+            advertises SetVariable at runtime.
+
+            Verify with `sha256sum -c SHA256SUMS`.
