@@ -14,14 +14,13 @@ on:
   pull_request:
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0   # u-boot stamps `git describe` into the binary
 
@@ -45,6 +44,17 @@ jobs:
       # which is on by default) because it is built from a different commit
       # -- that is not drift, it is two different releases correctly saying
       # so in their own version strings.
+      #
+      # PACKAGE VERSIONS ARE ALSO PINNED, not just the base image. The base
+      # image's own apt sources point at deb.debian.org, which is a rolling
+      # mirror: `apt-get update` inside even this pinned image fetches
+      # whatever bookworm currently has, so two runs months apart can still
+      # install different toolchain package versions from the same image
+      # digest. Pointing apt at snapshot.debian.org, at the date baked into
+      # the image tag (2025-09-08), freezes that too -- the same package
+      # versions are installed today and a year from now, from the same
+      # immutable archive. `Acquire::Check-Valid-Until "false"` is needed
+      # because an old snapshot's Release file has an expired Valid-Until.
       - name: build in the pinned toolchain container, twice, and compare
         run: |
           epoch=$(git log -1 --format=%ct)
@@ -56,6 +66,11 @@ jobs:
               -e SOURCE_DATE_EPOCH="$epoch" -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
               debian:bookworm-20250908-slim@sha256:df52e55e3361a81ac1bead266f3373ee55d29aa50cf0975d440c2be3483d8ed3 \
               bash -euo pipefail -c '
+                sed -i \
+                  -e "s#http://deb.debian.org/debian-security#http://snapshot.debian.org/archive/debian-security/20250908T000000Z#" \
+                  -e "s#http://deb.debian.org/debian\$#http://snapshot.debian.org/archive/debian/20250908T000000Z#" \
+                  /etc/apt/sources.list.d/debian.sources
+                echo "Acquire::Check-Valid-Until \"false\";" > /etc/apt/apt.conf.d/no-check-valid-until
                 export DEBIAN_FRONTEND=noninteractive
                 apt-get update -qq
                 apt-get install -y -qq --no-install-recommends \
@@ -98,13 +113,13 @@ jobs:
 
           # Reproducibility is asserted directly, every run, rather than
           # against a value recorded once and left to rot: two independent
-          # builds of the same commit, same pinned toolchain and epoch, must
-          # produce byte-identical output (`git clean -qfdx` between them so
-          # the second is not merely reusing the first's object files). A
-          # toolchain drifting under an unpinned tag, or a Kconfig default
-          # changing upstream, shows up here as a build failure, not as a
-          # silent difference discovered later by comparing against a stale
-          # recorded pin.
+          # builds of the same commit, same pinned toolchain, snapshot and
+          # epoch, must produce byte-identical output (`git clean -qfdx`
+          # between them so the second is not merely reusing the first's
+          # object files). A toolchain drifting under an unpinned tag, or a
+          # Kconfig default changing upstream, shows up here as a build
+          # failure, not as a silent difference discovered later by
+          # comparing against a stale recorded pin.
           build /tmp/round1
           build /tmp/round2
           cmp /tmp/round1/u-boot.bin /tmp/round2/u-boot.bin ||
@@ -122,15 +137,29 @@ jobs:
           echo "--- version string baked into the binary ---"
           strings -t d artifacts/u-boot.bin | grep -m1 "U-Boot 20"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: u-boot-${{ github.sha }}
           path: artifacts/*
           if-no-files-found: error
 
+  # A GitHub Release is the only thing that needs a write token, so it is
+  # the only job that holds one, and it only ever runs on a tag push. A
+  # pull_request or plain branch push never reaches it.
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: u-boot-${{ github.sha }}
+          path: artifacts
+
       - name: release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: artifacts/*
           fail_on_unmatched_files: true
